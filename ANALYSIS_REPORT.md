@@ -105,12 +105,12 @@
 
 **Функциональные требования:**
 - Запуск расчета: `POST /api/orders/{orderNo}/calculate`
-- WebSocket для прогресса: `/api/jobs/{jobId}/ws`
+- Получение статуса: `GET /api/jobs/{jobId}/status` (polling)
 - Отмена расчета: `POST /api/jobs/{jobId}/cancel`
 
 **Состав работ:**
 1. API сервис для запуска расчета
-2. WebSocket сервис для получения прогресса
+2. Polling статуса расчета
 3. MobX store: управление статусом расчета, прогресс, лог
 4. UI компонент: модальное окно с прогрессом и логом
 
@@ -145,14 +145,12 @@
 **Функциональные требования:**
 - Запуск job: `POST /api/jobs/calculate`
 - Polling статуса: `GET /api/jobs/{jobId}/status`
-- WebSocket: `/api/jobs/{jobId}/ws`
-- Рассылка уведомлений (WebSocket)
+- Рассылка уведомлений (email / база данных)
 
 **Состав работ:**
 1. API сервис для запуска расчета
 2. Job queue (Bull/Redis) на backend
-3. WebSocket сервис для уведомлений
-4. UI компонент: панель задач расчета
+3. UI компонент: панель задач расчета
 
 **Оценка: 20 часов**
 
@@ -269,11 +267,11 @@
 - Автообновление данных
 
 **Функциональные требования:**
-- WebSocket: `/api/orders/{orderNo}/changes`
+- Polling изменений: `GET /api/orders/{orderNo}/changes`
 - События: order.changed, item.added, item.removed
 
 **Состав работ:**
-1. WebSocket сервис для уведомлений
+1. API сервис для отслеживания изменений
 2. MobX store: обработка событий
 3. UI notification
 
@@ -768,11 +766,11 @@
 
 **Функциональные требования:**
 - Запуск: `POST /api/orders/{orderNo}/calculate`
-- WebSocket: `/api/jobs/{jobId}/ws`
+- Polling статуса: `GET /api/jobs/{jobId}/status`
 
 **Состав работ:**
 1. API сервис для запуска расчета
-2. WebSocket сервис для прогресса
+2. Polling статуса расчета
 3. UI компонент: модальное окно с прогрессом
 
 **Оценка: 16 часов**
