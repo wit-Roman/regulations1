@@ -1,3 +1,8 @@
+# Техническое задание на Frontend-разработку (React/MobX/AntD)
+## ModernGlass ShapeViewer - Миграция с Delphi на React
+
+---
+
 ## 5.2 Специальные задачи
 
 ### 5.2.1 Загрузка контролек при входе в заказ
@@ -65,22 +70,7 @@
    - При ошибке — добавление сообщения в `EText`
 
 ##### Этап 2: Отображение контролек (MainUnit.UploadCheckList)
-1. **Создание вкладки:**
-   ```pascal
-   aSheet := TNxTabSheet.Create(PageControl1);
-   aSheet.Caption := 'Чек лист';
-   ```
-
-2. **Создание фрейма:**
-   ```pascal
-   CheckListFrame := TCheckListFrame.Create(
-     PageControl1.Pages[PageControl1.PageCount-1], 
-     chklist, 
-     Projtext
-   );
-   ```
-
-3. **Инициализация UI:**
+**Инициализация UI:**
    - Вызов `CheckListFrame.InitializeCheckListFrame`
    - Активация вкладки: `PageControl1.ActivePageIndex := 0`
    - Блокировка меню: `SetMenuControlsStatus(false)`, `SetbuttonStatus(false)`
@@ -167,8 +157,8 @@
          AND zl_mod = 1 AND view_id = :pane-1
        ```
 
-5. **Финализация:**
-   - Коммит транзакции: `DBCommit`
+5. **По сабмиту:**
+   - Запись: `DBCommit`
    - Перепроверка заказа: `MainForm.ReCheckOrder(true)`
    - Закрытие фрейма при отсутствии ошибок
 
@@ -181,10 +171,451 @@
 - Проверка на "Повтор стекла": `msg_id = 521`
 
 **Состав работ:**
-1. API сервис для загрузки контролек и текста проекта
-2. API сервис для загрузки МГ-замен стекол
-3. API сервис для применения замен стекол
+1. API репозиторий для загрузки контролек и текста проекта
+2. API репозиторий для загрузки МГ-замен стекол
+3. API репозиторий для применения замен стекол
 4. MobX store: загрузка данных, вычисление ошибок/предупреждений, управление заменами
 5. UI компонент: фрейм с 2 панелями (список сообщений + текст проекта)
 6. UI компонент: модальное окно замены стекол с превью изменений
 7. Интеграция с главной формой (автооткрытие при загрузке заказа)
+
+**Оценка: 10 часов**
+
+---
+
+### 5.2.2 Замена стекол на МГ
+
+#### Цель
+Автоматизировать замену повторяющихся стекол в заказе на МГ-аналоги (многослойные стекла) для оптимизации производства и снижения количества уникальных стекол в заказе.
+
+#### Расположение
+- **Модуль замены:** `OutputUnits\CheckListUnit.pas` — `TCheckListFrame.ChangeGlassButtonClick()`
+- **Модуль ввода стекла:** `InputUnits\FormChangeGlass\GlasInputUnit.pas` — `TGlasInputForm`
+- **Модуль ввода слоя:** `InputUnits\FormChangeGlass\LayerInputUnit.pas` — `TLayerInputForm`
+- **Фрейм кодов замены:** `InputUnits\u_ChangeGlassCodesFrame.pas` — `TChangeGlassCodesFrame`
+- **Главная форма:** `MainUnit.pas` — `TMainForm`
+
+**Таблицы БД:**
+- `liorder.auf_pos` — позиции заказа (основные стекла)
+- `liorder.auf_komp` — компоненты позиций (дополнительные стекла)
+- `mg_order.mg_glass` — таблица замен МГ-стекол
+- `liorder.master_glass` — справочник стекол
+- `liorder.KOMP_AUFBAU` — структура компонентов стекла
+
+#### Предусловия
+1. Заказ загружен и отображается в главной форме
+2. В чек-листе присутствует сообщение с `msg_id = 521` ("Повтор стекла")
+3. Кнопка "Замена стекол" (`ChangeGlassButton`) видима и активна
+4. Пользователь инициировал замену нажатием кнопки
+
+#### Роли
+| Роль | Описание |
+|------|----------|
+| **Пользователь** | Оператор, выполняющий замену стекол |
+| **TCheckListFrame** | Фрейм контролек, инициирующий замену |
+| **TGlasInputForm** | Модальное окно выбора стекла для замены |
+| **TLayerInputForm** | Модальное окно выбора слоя для замены |
+| **TChangeGlassCodesFrame** | Фрейм отображения кодов замены |
+| **TTransactionDM** | DataModule для сохранения изменений в БД |
+| **TDrawingDM** | DataModule для загрузки данных о стеклах и МГ-заменах |
+
+#### Логика работы
+
+##### Этап 1: Инициация замены (ChangeGlassButtonClick)
+1. **Подготовка структур данных:**
+   - Создание списка ошибок: `ErrText := TStringList.Create`
+   - Инициализация списка позиций: `OrderItems: TOrderItems`
+   - Инициализация списка стекол: `GlassList: TChangeGlassList`
+
+2. **Загрузка данных о стеклах заказа:**
+   - SQL-запрос к `liorder.auf_pos` и `liorder.auf_komp`:
+     ```sql
+     SELECT auf_pos, pane, coalesce(komp_lage_nr, 0) komp_lage_nr,
+            coalesce(comp_product, 0) comp_product, Glas,
+            coalesce((SELECT mgl.base_glass_id FROM mg_order.mg_glass mgl 
+                      WHERE mgl.glass_id = Glas), 0) base_glas
+     FROM (
+       SELECT t.auf_pos, t.pane, ak.komp_lage_nr+1 komp_lage_nr,
+              mg_order.get_comp_product(t.auf_nr, t.auf_pos, t.pane, 
+                                        ak.komp_lage_nr+1, 0) comp_product,
+              CASE WHEN komp_art_num IS NULL THEN t.glas ELSE komp_art_num END Glas
+       FROM (
+         SELECT auf_nr, auf_pos, variante, pane, glas FROM (
+           SELECT auf_nr, auf_pos, variante, pane,
+                  CASE WHEN pane=1 THEN glas1 WHEN pane=2 THEN glas2
+                       WHEN pane=3 THEN glas3 WHEN pane=4 THEN glas4
+                       WHEN pane=5 THEN glas5 ELSE 0 END glas
+           FROM (
+             SELECT ap.auf_nr, ap.auf_pos, variante,
+                    glas1, glas2, glas3, ap.ap_glass4 glas4, 
+                    ap.ap_glass5 glas5, pane
+             FROM generate_series(1,5) Pane, liorder.AUF_POS ap
+             WHERE ap.auf_nr = :Order_no AND ap.variante = 0
+           ) t
+         ) t WHERE glas <> 0
+       ) t LEFT JOIN liorder.AUF_KOMP ak 
+         ON t.auf_nr = ak.auf_nr AND t.auf_pos = ak.auf_pos 
+         AND t.pane-1 = ak.glas_nr AND ak.komp_art_typ = 0
+         AND t.variante = ak.variante
+     ) t ORDER BY auf_pos, pane, comp_product
+     ```
+   - Параметр: `Order_no` — номер заказа
+
+3. **Формирование массива позиций:**
+   - Группировка по `auf_pos` (позиция заказа)
+   - Для каждой позиции:
+     - Сохранение `pane_no` (панель 1-5)
+     - Сохранение `comp_no` (номер компонента, 0 для основного стекла)
+     - Сохранение `Glas` (код стекла)
+     - Вычисление `base_glas` (базовое стекло через `mg_glass.base_glass_id`)
+     - Флаг `mg_glass = true`, если стекло уже является МГ
+
+##### Этап 2: Формирование списка замен
+1. **Уникализация базовых стекол:**
+   - Для каждой позиции и компонента:
+     - Проверка уникальности: `checkGlassExists(base_glas)`
+     - Если стекло новое → добавление в `GlassList`
+
+2. **Загрузка МГ-аналогов:**
+   - Для каждого уникального `base_glas`:
+     ```sql
+     SELECT mgl.glass_id
+     FROM mg_order.mg_glass mgl
+     WHERE mgl.base_glass_id = :glass
+     ORDER BY mgl.glass_seq
+     ```
+   - Заполнение массива `MG_GL_List`
+
+3. **Структура записи замены:**
+   ```pascal
+   TChangeGlass = record
+     Gl_code: integer;           // Код базового стекла
+     Gl_NexNum: integer;         // Счетчик замен (начиная с 1)
+     base_set: boolean;          // Флаг: установлено ли базовое стекло
+     MG_GL_List: array of integer; // Массив кодов МГ-аналогов
+   end;
+   ```
+
+##### Этап 3: Распределение замен
+1. **Алгоритм GetNewCode:**
+   - Вход: `gl_code` (базовое стекло), `mg_glass` (флаг МГ)
+   - Если `mg_glass = false` и `base_set = false`:
+     - Возврат оригинального кода: `result := gl_code`
+     - Установка флага: `base_set := true`
+   - Иначе:
+     - Проверка доступности аналога: `Gl_NexNum-1 <= High(MG_GL_List)`
+     - Возврат кода из списка: `result := MG_GL_List[Gl_NexNum-1]`
+     - Инкремент счетчика: `Gl_NexNum := Gl_NexNum + 1`
+
+2. **Применение замен к компонентам:**
+   - Для каждой позиции и компонента:
+     - Вызов: `glass_new := GetNewCode(base_glas, mg_glass)`
+     - Если `glass_new > 0` → сохранение в `glass_new`
+     - Иначе → добавление ошибки в `ErrText`
+
+3. **Проверка ошибок:**
+   - Если `ErrText.Text <> ''`:
+     - Вывод сообщения: `MessageDlg('Ошибка! Замена не возможна.' + ErrText.Text)`
+     - Прерывание операции
+
+##### Этап 4: Сохранение изменений
+1. **Обновление основных стекол (komp_lage_nr = 0):**
+   - Для панелей 1-3:
+     ```sql
+     UPDATE liorder.auf_pos 
+     SET glas{pane_no} = :glass_new
+     WHERE auf_nr = :OrderNo AND auf_pos = :ItemNo AND variante = 0
+     ```
+   - Для панелей 4-5:
+     ```sql
+     UPDATE liorder.auf_pos 
+     SET ap_glass{pane_no} = :glass_new
+     WHERE auf_nr = :OrderNo AND auf_pos = :ItemNo AND variante = 0
+     ```
+
+2. **Обновление текста позиции:**
+   ```sql
+   UPDATE liorder.auf_text 
+   SET zl_str = (SELECT mg.glass_desc FROM liorder.master_glass mg 
+                 WHERE mg.glass_id = :glass_new)
+   WHERE auf_nr = :OrderNo AND auf_pos = :ItemNo 
+     AND variante = 0 AND zl_mod = 1 AND view_id = :pane-1
+   ```
+
+3. **Обновление компонентов (komp_lage_nr > 0):**
+   ```sql
+   UPDATE liorder.auf_komp 
+   SET komp_art_num = :glass_new,
+       comp_desc = (SELECT mg.glass_desc FROM liorder.master_glass mg 
+                    WHERE mg.glass_id = :glass_new)
+   WHERE auf_nr = :OrderNo AND auf_pos = :ItemNo AND variante = 0
+     AND komp_art_typ = 0 AND glas_nr = :pane-1 
+     AND komp_lage_nr = :comp-1 AND komp_art_num = :glass_old
+   ```
+
+4. **Транзакция:**
+   - Начало: автоматически при создании `TTransactionDM`
+   - Коммит: `DBCommit` при успехе
+   - Откат: `DBRollback` при ошибке
+
+5. **Финализация:**
+   - Перепроверка заказа: `MainForm.ReCheckOrder(true)`
+   - Закрытие фрейма контролек
+   - Вывод сообщения об успехе
+
+**Требования к UI:**
+- Модальное окно со списком уникальных стекол для замены
+- Select для выбора замены из МГ-списка
+- Превью изменений (какие позиции будут изменены)
+- Индикация текущей замены (какое стекло заменяется на какое)
+
+**Функциональные требования:**
+- Загрузка позиций: `GET /api/orders/{orderNo}/items`
+- Загрузка МГ-замен: `GET /api/glass/{glCode}/mg-replacements`
+- Логика замены: алгоритм `GetNewCode(gl_code, mg_glass)`
+- Применение замен: `POST /api/orders/{orderNo}/glass-changes`
+- Валидация перед сохранением (проверка доступности аналогов)
+
+**Состав работ:**
+1. API сервис для загрузки данных о стеклах заказа
+2. API сервис для загрузки МГ-замен
+3. API сервис для применения замен стекол
+4. MobX store: управление списком замен, вычисление новых кодов
+5. UI компонент: модальное окно с 2 колонками (оригиналы/замены)
+6. UI компонент: превью изменений по позициям
+7. Валидация перед сохранением
+
+**Оценка: 16 часов**
+
+---
+
+### 5.2.3 Постобработка при входе/получении заказа
+
+#### Цель
+Выполнить автоматический расчет параметров заказа после загрузки (геометрия, ступени, снятие покрытия, логотипы, опорные стороны) и сохранить результаты расчета в базу данных для последующего отображения чертежей.
+
+#### Расположение
+- **Модуль расчета:** `DataModules\u_DrawingDM.pas` — `TDrawingDM.CalcAndSaveDataForOrder()`
+- **Поток расчета:** `DataModules\u_DrawingDM.pas` — `TCalcOrderThread`
+- **Поток сохранения:** `DataModules\u_DrawingDM.pas` — `TSaveCalcOrderThread`
+- **Прогресс-бар:** `ProgressUnit.pas` — `TProgressForm`
+- **Главная форма:** `MainUnit.pas` — `TMainForm.RecalcDataForOrder()`
+
+**Таблицы БД:**
+- `mg_order.calc_dimensions` — расчетные размеры
+- `mg_order.calc_edges` — значения по сторонам
+- `mg_order.calc_params` — параметры расчета
+- `mg_order.ITEM_HASH` — хэши для проверки изменений
+- `mg_order.sup_side` — опорные стороны
+- `mg_order.decoating` — снятие покрытия
+- `mg_order.term_logo` — логотипы закалки
+- `mg_order.lam_logo` — логотипы ламината
+
+#### Предусловия
+1. Заказ загружен через `LoadButtonClick()`
+2. Номер заказа введен в `OrderEdit` и прошел валидацию
+3. Данные заказа сохранены через `SetDeaultOrderParam()`
+4. Чек-лист загружен и проверен (нет критических ошибок)
+5. Пользователь инициировал расчет (автоматически или через `RecalcOrderClick()`)
+
+#### Роли
+| Роль | Описание |
+|------|----------|
+| **Пользователь** | Оператор, инициирующий расчет заказа |
+| **TMainForm** | Главная форма, управляющая процессом расчета |
+| **TDrawingDM** | DataModule для получения данных и управления расчетом |
+| **TCalcOrderThread** | Поток выполнения расчета параметров |
+| **TSaveCalcOrderThread** | Поток сохранения результатов расчета |
+| **TProgressForm** | Модальное окно с прогресс-баром и логом |
+
+#### Логика работы
+
+##### Этап 1: Инициация расчета (MainUnit.RecalcDataForOrder)
+1. **Подготовка к расчету:**
+   - Проверка загруженного заказа: `CheckOrderLoaded`
+   - Блокировка интерфейса: `Screen.Cursor := crSQLWait`
+   - Подключение к БД: `DrawingDM.DBConnect`
+   - Установка флага: `DrawingDM.CalcOrderData := true`
+   - Открытие query: `DrawingDM.OpenCommonDataQuery(OrderNo, 0)`
+
+2. **Запуск расчета:**
+   ```pascal
+   LogText := '';
+   DrawingDM.CalcAndSaveDataForOrder(OrderNo, RecalcAll, LogText);
+   ```
+   - Параметр `RecalcAll`:
+     - `true` — полный пересчет всех позиций
+     - `false` — пересчет только измененных позиций
+
+3. **Обработка результатов:**
+   - Если `LogText <> ''` → вывод сообщений об ошибках: `MessageCalcErrModal(LogText)`
+   - Сброс флага: `DrawingDM.CalcOrderData := false`
+   - Закрытие query: `DrawingDM.CloseCommonDataQuery`
+   - Отключение от БД: `DrawingDM.DBDisconnect`
+
+##### Этап 2: Подготовка данных (DrawingDM.CalcAndSaveDataForOrder)
+1. **Загрузка списка для расчета:**
+   ```pascal
+   CalcItemList := GetCalcItemList(Order_no, RecalcAll);
+   ```
+   - Возвращает массив `TCalcItemList` — позиции для расчета
+   - При `RecalcAll = false` — только позиции с измененными хэшами
+
+2. **Создание прогресс-бара:**
+   ```pascal
+   ProgressForm := TProgressForm.Create(nil);
+   ProgressForm.Caption := 'Расчет данных..';
+   ProgressForm.ProgressBar1.Max := length(CalcItemList) + 3;
+   ProgressForm.ProgressBar1.Position := 0;
+   ```
+   - Если позиций > 7 → показ окна: `ProgressForm.Show`
+   - Если `RecalcAll = false` → режим `fsStayOnTop`
+
+3. **Инициализация лога:**
+   ```pascal
+   setlength(CalcOrderLog, 0);
+   ```
+
+##### Этап 3: Расчет параметров (TCalcOrderThread.Execute)
+1. **Создание потока:**
+   ```pascal
+   CalcOrderThread := TCalcOrderThread.Create(
+     @CalcItemList,      // Список позиций
+     @CalcOrderLog,      // Лог ошибок
+     ProgressForm.ProgressBar1,  // Прогресс-бар
+     DrawingSettings     // Настройки отображения
+   );
+   ```
+
+2. **Запуск потока:**
+   ```pascal
+   CalcOrderThread.Resume;
+   CalcOrderThread.Waitfor;
+   ```
+
+3. **Методы расчета (TCalcOrderThread):**
+   - `CalculateSupSideData(i)` — расчет опорных сторон
+   - `CalculateTurnSideData(i)` — расчет поворота сторон
+   - `CalculateRightAngle(i)` — проверка прямых углов
+   - `CalculateLineLength(i)` — расчет длин линий
+   - `CalculateItemStepData(i)` — расчет ступеней
+   - `CalculateDecoatData(i)` — расчет снятия покрытия
+   - `SetLogoMirrorTextForTermProc(i)` — текст зеркала логотипа
+   - `SetMirrorForGlassByTermLogo(i)` — зеркало стекла по логотипу
+
+4. **Обновление прогресс-бара:**
+   ```pascal
+   procedure TCalcOrderThread.ProgressBarNext;
+   begin
+     fProgressBar.Position := fProgressBar.Position + 1;
+   end;
+   ```
+
+5. **Регистрация ошибок:**
+   ```pascal
+   procedure SetItemError(i: integer; LineText: string);
+   begin
+     // Добавление записи в CalcOrderLog
+     // Line_items: массив [order_no, item_no, pane_no, comp_no]
+     // Line_text: текст ошибки
+   end;
+   ```
+
+##### Этап 4: Сохранение результатов (TSaveCalcOrderThread.Execute)
+1. **Смена статуса:**
+   ```pascal
+   ProgressForm.Caption := 'Сохранение..';
+   ProgressForm.Repaint;
+   ```
+
+2. **Создание потока сохранения:**
+   ```pascal
+   SaveCalcOrderThread := TSaveCalcOrderThread.Create(
+     @CalcItemList,    // Список позиций
+     Order_no,         // Номер заказа
+     RecalcAll,        // Флаг полного пересчета
+     ProgressForm.ProgressBar1
+   );
+   ```
+
+3. **Запуск и ожидание:**
+   ```pascal
+   SaveCalcOrderThread.Resume;
+   SaveCalcOrderThread.Waitfor;
+   ```
+
+4. **Проверка результата:**
+   ```pascal
+   if not SaveCalcOrderThread.DataSaved then
+     raise Exception.Create('Ошибка сохранения данных');
+   ```
+
+5. **Метод сохранения (TSaveCalcOrderThread):**
+   - Для каждой позиции из `CalcItemList`:
+     - Сохранение в `mg_order.calc_dimensions`
+     - Сохранение в `mg_order.calc_edges`
+     - Сохранение в `mg_order.calc_params`
+     - Обновление хэша в `mg_order.ITEM_HASH`
+   - Транзакционное выполнение через `TTransactionDM`
+
+##### Этап 5: Формирование отчета
+1. **Сбор лога:**
+   ```pascal
+   for i := low(CalcOrderLog) to high(CalcOrderLog) do
+   begin
+     if LogText = '' then
+       LogText := '№: ' + DrawingDm.FromArrToStr(CalcOrderLog[i].Line_items) + 
+                  '. ' + CalcOrderLog[i].Line_text
+     else
+       LogText := LogText + #13#10 + '№: ' + 
+                  DrawingDm.FromArrToStr(CalcOrderLog[i].Line_items) + 
+                  '. ' + CalcOrderLog[i].Line_text;
+   end;
+   ```
+
+2. **Формат записи:**
+   - `№: [order_no, item_no, pane_no, comp_no]. Текст ошибки`
+
+3. **Обновление прогресс-бара:**
+   ```pascal
+   ProgressForm.Repaint;
+   ```
+
+4. **Очистка:**
+   ```pascal
+   FreeAndNil(ProgressForm);
+   ```
+
+##### Этап 6: Закрытие прогресс-бара (TProgressForm.FormCloseQuery)
+```pascal
+procedure TProgressForm.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+begin
+  CanClose := (ProgressBar1.Position = 0);
+end;
+```
+- Запрет закрытия во время выполнения расчета
+
+**Требования к UI:**
+- Модальное окно с прогресс-баром (0-100%)
+- Отображение текущего шага расчета
+- Лог выполнения (список сообщений об ошибках)
+- Кнопка "Отменить" (при возможности прерывания)
+- Автоматическое закрытие после завершения
+
+**Функциональные требования:**
+- Запуск расчета: `POST /api/orders/{orderNo}/calculate`
+- Получение статуса: `GET /api/jobs/{jobId}/status` (polling)
+- Отмена расчета: `POST /api/jobs/{jobId}/cancel`
+- Получение лога: `GET /api/jobs/{jobId}/log`
+
+**Состав работ:**
+1. API сервис для запуска расчета заказа
+2. API сервис для получения статуса расчета (polling)
+3. API сервис для отмены расчета
+4. API сервис для получения лога расчета
+5. MobX store: управление статусом расчета, прогресс, лог ошибок
+6. UI компонент: модальное окно с прогресс-баром
+7. UI компонент: список сообщений лога
+8. Интеграция с главной формой (автозапуск при загрузке заказа)
+
+**Оценка: 12 часов**
